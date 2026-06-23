@@ -1,3 +1,10 @@
+"""
+Persistence layer for Worksheet Automation – PostgreSQL on Render.
+
+Opens a fresh connection per db_session to avoid stale/broken SSL connections.
+Uses CITEXT for case‑insensitive email lookups and RealDictCursor for row access.
+"""
+
 import os
 import secrets
 from contextlib import contextmanager
@@ -5,37 +12,35 @@ from datetime import date, timedelta
 
 import psycopg2
 import psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
 
 import config
 
 # ---------------------------------------------------------------------------
-# Database connection – pulled from the environment Render injects
+# Database URL – provided by Render
 # ---------------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable must be set")
 
-# Small, thread‑safe pool suitable for a low‑traffic SaaS.
-# Increase maxconn if you expect many concurrent requests.
-pool = ThreadedConnectionPool(
-    minconn=1,
-    maxconn=5,
-    dsn=DATABASE_URL,
-    cursor_factory=psycopg2.extras.RealDictCursor,
-)
+# Ensure SSL and keep-alive settings (Render requires SSL)
+_EXTRA_PARAMS = "?sslmode=require&connect_timeout=10&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+if "?" in DATABASE_URL:
+    # Append if not already present
+    if "sslmode" not in DATABASE_URL:
+        DATABASE_URL += "&sslmode=require&connect_timeout=10&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5"
+else:
+    DATABASE_URL += _EXTRA_PARAMS
 
 # ---------------------------------------------------------------------------
-# Constants (identical to original)
+# Constants
 # ---------------------------------------------------------------------------
 VALID_STATUSES = ("trial", "active", "expired", "paused", "paused_error", "cancelled")
 VALID_DIFFICULTIES = ("easier", "normal", "challenge", "review")
 
 # ---------------------------------------------------------------------------
-# Schema – CITEXT gives case‑insensitive email lookups without extra code
+# Schema
 # ---------------------------------------------------------------------------
 SCHEMA = """
-    -- Enable CITEXT extension (safe to call repeatedly)
     CREATE EXTENSION IF NOT EXISTS citext;
 
     CREATE TABLE IF NOT EXISTS parents (
@@ -85,21 +90,23 @@ SCHEMA = """
 """
 
 # ---------------------------------------------------------------------------
-# Connection helpers
+# Connection helper (opens a new connection every time)
 # ---------------------------------------------------------------------------
-def get_conn():
-    """Borrow a connection from the pool."""
-    return pool.getconn()
+def _get_connection():
+    """Create a fresh psycopg2 connection with SSL and keepalive settings."""
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+    conn.autocommit = False
+    return conn
 
-def put_conn(conn):
-    """Return connection to the pool."""
-    pool.putconn(conn)
 
 @contextmanager
 def db_session():
-    """Context manager that borrows a connection, commits on success,
-    rolls back on error, and always returns the connection."""
-    conn = get_conn()
+    """Context manager that opens a new connection, commits on success,
+    rolls back on error, and always closes the connection."""
+    conn = _get_connection()
     try:
         yield conn
         conn.commit()
@@ -107,22 +114,22 @@ def db_session():
         conn.rollback()
         raise
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 def init_db():
     """Run schema creation (idempotent). Call once at app startup."""
-    conn = get_conn()
+    conn = _get_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
         conn.commit()
     finally:
-        put_conn(conn)
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Parents – every function works exactly like before
+# Parents – function signatures completely unchanged
 # ---------------------------------------------------------------------------
 
 def create_parent(name, email, child_name, grade_level, subject_focus,
@@ -293,8 +300,6 @@ def find_expired_trials():
             return cur.fetchall()
 
 
-# ---------------------------------------------------------------------------
-# Run directly to initialise the database (e.g. python db.py)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     init_db()
