@@ -108,7 +108,7 @@ TRIAL_SWEEP_HOUR       = _get_int("TRIAL_SWEEP_HOUR", 1)  # 0-23
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
 DB_PATH_OVERRIDE = os.getenv("DB_PATH")   # mainly for tests
 CSV_PATH_OVERRIDE = os.getenv("CSV_PATH") # mainly for tests
-
+DEBUG_KEY = os.getenv("DEBUG_KEY")
 
 def configure_logging():
     logging.basicConfig(
