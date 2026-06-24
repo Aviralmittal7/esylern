@@ -22,10 +22,11 @@ Robustness measures over the original version:
 """
 import logging
 import threading
-from datetime import date
-import os
+from datetime import date, datetime
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 import config
 import db
@@ -63,6 +64,12 @@ def _unsubscribe_url(parent_row):
 
 
 def process_parent(parent_id):
+    """Generate, render, and email one worksheet for one parent. Safe to
+    call directly (e.g. for an immediate "welcome" worksheet) or from the
+    scheduler. Never raises -- all failures are caught, logged, and
+    recorded in delivery_log so a bad afternoon for the LLM provider
+    doesn't crash the whole process.
+    """
     logger.info("process_parent: starting for parent_id=%s", parent_id)
     topic = difficulty = None
     try:
@@ -79,9 +86,16 @@ def process_parent(parent_id):
         prefs = db.get_preferences(parent_id)
         difficulty = (prefs["difficulty_mode"] if prefs and prefs["difficulty_mode"] else "normal")
 
+        # Parse the comma-separated subject list and rotate through them one
+        # delivery at a time.  Previously the raw string "Maths,Science" was
+        # passed directly to the LLM as both subject AND topic, which produced
+        # confusing prompts like "create a worksheet on Maths,Science focused
+        # on the topic: Maths,Science".  Now each delivery picks exactly one.
         subjects = [s.strip() for s in parent["subject_focus"].split(",") if s.strip()]
         current_subject = _pick_subject(parent_id, subjects)
 
+        # Use the stored topic preference only when it's a real override — not
+        # when it's the raw comma-joined string auto-populated at signup.
         pref_topic = prefs["topic"] if prefs and prefs["topic"] else ""
         if pref_topic and pref_topic != parent["subject_focus"] and "," not in pref_topic:
             topic = pref_topic
@@ -94,38 +108,62 @@ def process_parent(parent_id):
                     difficulty, parent["child_name"], parent["email"], current_subject, topic)
 
         student_text, answer_key, model_used = generate_worksheet_text(
-            grade=parent["grade_level"], subject=current_subject, topic=topic,
-            difficulty=difficulty, avoid_topics=avoid_topics,
+            grade=parent["grade_level"],
+            subject=current_subject,
+            topic=topic,
+            difficulty=difficulty,
+            avoid_topics=avoid_topics,
         )
-        worksheet_bytes = create_worksheet_pdf(student_text, parent["child_name"], current_subject, topic)
-        answer_bytes = create_answer_pdf(answer_key, parent["child_name"], current_subject, topic)
+
+        worksheet_bytes = create_worksheet_pdf(
+            student_text,
+            parent["child_name"], current_subject, topic,
+        )
+        answer_bytes = create_answer_pdf(
+            answer_key,
+            parent["child_name"], current_subject, topic,
+        )
 
         send_worksheet_email(
-            to_email=parent["email"], child_name=parent["child_name"],
-            worksheet_pdf_bytes=worksheet_bytes, answer_pdf_bytes=answer_bytes,
-            subject=current_subject, topic=topic,
+            to_email=parent["email"],
+            child_name=parent["child_name"],
+            worksheet_pdf_bytes=worksheet_bytes,
+            answer_pdf_bytes=answer_bytes,
+            subject=current_subject,
+            topic=topic,
             unsubscribe_url=_unsubscribe_url(parent),
         )
 
         db.record_delivery_success(
-            parent_id, worksheet_file=f"{current_subject}_{topic}_worksheet.pdf",
-            topic=topic, difficulty=difficulty, summary=f"Sent via model {model_used}",
+            parent_id,
+            worksheet_file=f"{current_subject}_{topic}_worksheet.pdf",
+            topic=topic,
+            difficulty=difficulty,
+            summary=f"Sent via model {model_used}",
         )
         logger.info("-> Sent to %s", parent["email"])
 
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 - top-level safety net for a background job
         logger.exception("Failed to process worksheet for parent_id=%s: %s", parent_id, e)
         try:
             failures = db.record_delivery_failure(parent_id, topic or "", difficulty or "normal", e)
-        except Exception:
+        except Exception as record_error:
+            logger.error("Could not record delivery failure: %s", record_error)
             failures = None
         if failures is not None and failures >= config.MAX_CONSECUTIVE_FAILURES:
-            logger.error("Pausing parent_id=%s after %s consecutive failures.", parent_id, failures)
+            logger.error("Pausing parent_id=%s (%s) after %s consecutive failures.",
+                         parent_id, parent.get("email", "unknown"), failures)
             db.set_parent_status(parent_id, "paused_error")
             remove_parent_job(parent_id)
             send_admin_alert(
                 subject_line=f"Paused delivery for parent_id={parent_id}",
-                body=f"Worksheet delivery for parent_id={parent_id} paused after {failures} consecutive failures.\n\nLast error: {e}",
+                body=(
+                    f"Worksheet delivery for parent_id={parent_id} was "
+                    f"automatically paused after {failures} consecutive failures.\n\n"
+                    f"Last error: {e}\n\n"
+                    f"Fix the underlying issue and set their status back to 'active' or 'trial' "
+                    f"to resume."
+                ),
             )
 
 
@@ -233,9 +271,14 @@ def send_now(parent_id):
     with _lock:
         scheduler = _scheduler
     if scheduler:
-        scheduler.add_job(process_parent, args=[parent_id],
-                          id=f"welcome_{parent_id}_{date.today()}",
-                          misfire_grace_time=3600, replace_existing=True)
+        scheduler.add_job(
+            process_parent,
+            trigger=DateTrigger(run_date=datetime.now()),
+            args=[parent_id],
+            id=f"welcome_{parent_id}_{date.today()}",
+            misfire_grace_time=3600,
+            replace_existing=True
+        )
     else:
         logger.warning("Scheduler not running; sending welcome worksheet inline for parent_id=%s.", parent_id)
         threading.Thread(target=process_parent, args=(parent_id,), daemon=True).start()
