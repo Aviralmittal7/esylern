@@ -249,6 +249,30 @@ def unsubscribe(token):
         "<p>You're always welcome to sign up again.</p>"
         "</body></html>"
     )
+
+@app.route("/api/debug/run/<int:parent_id>", methods=["POST"])
+def debug_run_parent(parent_id):
+    """Run process_parent synchronously, bypassing the scheduler, and
+    return the resulting delivery_log row. Lets you see the *real* error
+    in the HTTP response instead of digging through Render logs."""
+    if not config.DEBUG_KEY or request.headers.get("X-Debug-Key") != config.DEBUG_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    from scheduler import process_parent
+    process_parent(parent_id)
+
+    with db.db_session() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, error_message, summary, sent_at FROM delivery_log "
+                "WHERE parent_id = %s ORDER BY id DESC LIMIT 1",
+                (parent_id,),
+            )
+            row = cur.fetchone()
+
+    return jsonify(dict(row) if row else {"note": "no delivery_log row written yet"}), 200
+
+
 @app.route("/api/debug/run/<int:parent_id>", methods=["POST"])
 def debug_run_parent(parent_id):
     """Run process_parent synchronously, bypassing the scheduler, and
